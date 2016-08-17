@@ -1,0 +1,432 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+#select strftime('%W', date), strftime('%w %d/%m',date,'weekday 0'), sum(round((substr(finish,1,2)+(substr(finish,4,2)+0.0)/60)-(substr(start,1,2)+(substr(start,4,2)+0.0)/60), 2)) from entries where customerId=4 and invoiceNo is null group by strftime('%W', date);
+# select start, finish, round((substr(finish,1,2)+(substr(finish,4,2)+0.0)/60)-(substr(start,1,2)+(substr(start,4,2)+0.0)/60), 2)  from entries;
+
+# update entries set invoiceNo='5-0002' where customerid=8 and invoiceno is null;
+# select invoiceNo, sum(round((substr(finish,1,2)+(substr(finish,4,2)+0.0)/60)-(substr(start,1,2)+(substr(start,4,2)+0.0)/60), 2)) from entries group by invoiceNo;
+
+import sys
+import sqlite3
+from datetime import datetime, time, timedelta
+
+import pygtk
+pygtk.require('2.0')
+import gtk
+import gobject
+
+import invoice
+
+gst_rate = 0.15
+
+def time_diff(a,b):
+    return round(((a.hour*60 + a.minute) - (b.hour*60 + b.minute)) / 60.0, 2)
+
+class Base:
+    def init_db(self):
+        sqlite3.register_adapter(time, lambda t: t.strftime('%H:%M'))
+        sqlite3.register_converter('time', lambda s: time(*map(int,s.split(':'))))
+
+        self.db_con = sqlite3.connect('timesheets.sdb', detect_types=sqlite3.PARSE_DECLTYPES)
+        self.db_con.execute("CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, name text, address text, rate text)")
+        self.db_con.execute("CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY AUTOINCREMENT, customerId int, date date, start time, finish time, description text, invoiceNo text)")
+        self.db_con.execute("create table if not exists invoices (customerId int, serial int, date date, gstRate text, name text, address text, primary key (customerId, serial))")
+        self.db_con.execute("CREATE TABLE IF NOT EXISTS invoiceLines (id INTEGER PRIMARY KEY AUTOINCREMENT, customerId int, serial int, qty text, desc text, unit_price text)")
+
+    def init_list(self):
+        self.liststore = gtk.ListStore(str, str, str, str, str)
+
+        treeview = gtk.TreeView(self.liststore)
+        cell_renderer = gtk.CellRendererText()
+
+        date_column = gtk.TreeViewColumn('Date')
+        date_column.pack_start(cell_renderer, True)
+        date_column.add_attribute(cell_renderer, 'text', 0)
+        treeview.append_column(date_column)
+
+        start_column = gtk.TreeViewColumn('Start')
+        start_column.pack_start(cell_renderer, True)
+        start_column.add_attribute(cell_renderer, 'text', 1)
+        treeview.append_column(start_column)
+
+        finish_column = gtk.TreeViewColumn('Finish')
+        finish_column.pack_start(cell_renderer, True)
+        finish_column.add_attribute(cell_renderer, 'text', 2)
+        treeview.append_column(finish_column)
+
+        duration_column = gtk.TreeViewColumn('Duration')
+        duration_column.pack_start(cell_renderer, True)
+        duration_column.add_attribute(cell_renderer, 'text', 3)
+        treeview.append_column(duration_column)
+
+        description_column = gtk.TreeViewColumn('Description')
+        description_column.pack_start(cell_renderer, True)
+        description_column.add_attribute(cell_renderer, 'text', 4)
+        treeview.append_column(description_column)
+
+        return treeview
+
+    def load_list(self):
+        self.liststore.clear()
+        for row in self.db_con.execute("SELECT date, start, finish, description FROM entries WHERE customerID = ? ORDER BY id", (self.selectedCustomerId,)):
+            self.append_list(row[0], row[1], row[2], row[3])
+
+    def append_list(self, date, start, finish, description):
+        self.liststore.append((date.strftime('%d-%b-%y'), start.strftime('%H:%M'), finish.strftime('%H:%M') if finish else None, time_diff(finish, start) if finish else None, description))
+
+    def init_display(self):
+        self.window = window = gtk.Window(gtk.WINDOW_TOPLEVEL)
+        window.set_border_width(10)
+        window.connect("destroy", self.destroy)
+
+        vbox = gtk.VBox(spacing=0)
+        window.add(vbox)
+
+        hbox0 = gtk.HBox(spacing=5)
+        vbox.pack_start(hbox0, False, False, 10)
+
+        hbox0.pack_start(gtk.Label('Customer:'), False, False, 0)
+
+        selected = self.db_con.execute("SELECT customerId FROM entries ORDER BY id DESC LIMIT 1").fetchone()
+        self.selectedCustomerId = selected[0] if selected else None
+        self.customer = gtk.combo_box_entry_new_text()
+
+        selectedIndex = None
+        index = 0
+        for row in self.db_con.execute("SELECT id, name FROM customers ORDER BY id"):
+            self.customer.append_text(row[1])
+            if row[0] == self.selectedCustomerId:
+                selectedIndex = index
+            index += 1
+        if selectedIndex != None:
+            self.customer.set_active(selectedIndex)
+
+        self.customer.connect("changed", self.customer_changed)
+        hbox0.pack_start(self.customer, False, False, 0)
+
+
+        listview = self.init_list()
+        self.load_list()
+
+        self.scrolled_window = gtk.ScrolledWindow()
+        self.scrolled_window.set_policy(gtk.POLICY_NEVER, gtk.POLICY_ALWAYS)
+        self.scrolled_window.set_shadow_type(gtk.SHADOW_OUT)
+        self.scrolled_window.add(listview)
+        scrollbar_width = self.scrolled_window.get_vscrollbar().size_request()[0]
+        self.scrolled_window.set_size_request(listview.size_request()[0] + scrollbar_width, scrollbar_width *10)
+        vbox.pack_start(self.scrolled_window, True)
+
+        hbox1 = gtk.HBox(spacing=5)
+        vbox.pack_start(hbox1, False, False, 10)
+
+        hbox1.pack_start(gtk.Label('Description:'), False, False, 0)
+
+        self.desc = gtk.combo_box_entry_new_text()
+        self.load_descriptions()
+        hbox1.pack_start(self.desc, False, False, 0)
+
+        start = gtk.Button('Start')
+        hbox1.pack_start(start, False, False, 0)
+        start.connect("clicked", self.start, None)
+
+        finish = gtk.Button('Stop')
+        hbox1.pack_start(finish, False, False, 0)
+        finish.connect("clicked", self.finish, None)
+
+        hbox2 = gtk.HBox(spacing=5)
+        vbox.pack_start(hbox2, False, False, 2)
+        self.time_today = gtk.Label()
+        hbox2.pack_start(self.time_today, False, False, 0)
+
+        hbox3 = gtk.HBox(spacing=5)
+        vbox.pack_start(hbox3, False, False, 2)
+        self.time_today_total = gtk.Label()
+        hbox3.pack_start(self.time_today_total, False, False, 0)
+
+        hbox4 = gtk.HBox(spacing=5)
+        vbox.pack_start(hbox4, False, False, 2)
+        self.time_this_week = gtk.Label()
+        hbox4.pack_start(self.time_this_week, False, False, 0)
+
+        hbox5 = gtk.HBox(spacing=5)
+        vbox.pack_start(hbox5, False, False, 0)
+        self.time_this_week_this_cust = gtk.Label()
+        hbox5.pack_start(self.time_this_week_this_cust, False, False, 0)
+
+        hbox6 = gtk.HBox(spacing=5)
+        vbox.pack_start(hbox6, False, False, 0)
+        self.time_this_task = gtk.Label()
+        hbox6.pack_start(self.time_this_task, False, False, 0)
+
+        self.update_time_indicators()
+
+        window.show_all()
+        self.scroll_to_bottom()
+
+
+    def start(self, widget, data=None):
+        self.finish(None, None)
+        self.add_customer()
+        now = datetime.now()
+        description = self.desc.get_active_text()
+        self.db_con.execute("INSERT INTO entries(customerId, date, start, description) VALUES(?, ?, ?, ?)", (self.selectedCustomerId, now.date(), now.time(), description))
+        self.db_con.commit()
+        self.append_list(now.date(), now.time(), None, description)
+        self.scroll_to_bottom()
+        if self.desc.get_active() == -1:
+            self.desc.append_text(description)
+
+    def finish(self, widget, data=None):
+        latest = self.latest()
+        if latest and latest[3] == None:
+            now = datetime.now().time()
+            self.db_con.execute("UPDATE entries SET finish = ? WHERE id = ?", (now, latest[0]))
+            self.db_con.commit()
+            self.liststore.remove(self.liststore.get_iter(len(self.liststore)-1))
+            self.append_list(latest[1], latest[2], now, latest[4])
+            self.scroll_to_bottom()
+
+    def scroll_to_bottom(self):
+        adjustment = self.scrolled_window.get_vadjustment()
+        adjustment.set_value(adjustment.get_upper())
+
+    def latest(self):
+        return self.db_con.execute("SELECT id, date, start, finish, description FROM entries ORDER BY id DESC LIMIT 1").fetchone()
+
+    def update_time_indicators(self):
+        now = datetime.now()
+        total = 0.0
+        for start, finish in self.db_con.execute("SELECT start, finish FROM entries WHERE customerId=? AND date=? ORDER BY id", (self.selectedCustomerId, now.date(),)):
+            if finish != None:
+                total += time_diff(finish, start)
+
+        today_total = 0.0
+        for start, finish in self.db_con.execute("SELECT start, finish FROM entries WHERE date=? ORDER BY id", (now.date(),)):
+            if finish != None:
+                today_total += time_diff(finish, start)
+
+        time_this_week = 0.0
+        for d, start, finish in self.db_con.execute("SELECT date, start, finish FROM entries WHERE strftime('%W-%Y', date) = strftime('%W-%Y', ?) ORDER BY id", (now.date(),)):
+            if finish != None:
+                time_this_week += time_diff(finish, start)
+
+        time_this_week_this_cust = 0.0
+        for d, start, finish in self.db_con.execute("SELECT date, start, finish FROM entries WHERE customerId=? AND strftime('%W-%Y', date) = strftime('%W-%Y', ?) ORDER BY id", (self.selectedCustomerId, now.date())):
+            if finish != None:
+                time_this_week_this_cust += time_diff(finish, start)
+
+        time_this_task = 0.0
+        for d, start, finish in self.db_con.execute("SELECT date, start, finish FROM entries WHERE customerId=? AND description=? ORDER BY id", (self.selectedCustomerId, self.desc.get_active_text())):
+            if finish != None:
+                time_this_task += time_diff(finish, start)
+
+
+        # add in time in latest open record
+        latest = self.latest()
+        if latest and latest[3] == None:
+            latest_time = time_diff(now.time(), latest[2])
+            total +=latest_time
+            today_total += latest_time
+            time_this_week += latest_time
+            time_this_week_this_cust += latest_time
+            time_this_task += latest_time
+
+        self.time_today.set_text('Time today this customer: ' + str(total))
+        self.time_today_total.set_text('Time today all customers: ' + str(today_total))
+        self.time_this_week_this_cust.set_text('Time this week this customer: ' + str(time_this_week_this_cust))
+        self.time_this_week.set_text('Time this week: ' + str(time_this_week))
+        self.time_this_task.set_text('Time this task: ' + str(time_this_task))
+
+        gobject.timeout_add_seconds(10, self.update_time_indicators)
+
+    def customer_changed(self, combo):
+        self.finish(None, None)
+        selected = self.db_con.execute("SELECT id FROM customers WHERE name=? LIMIT 1", (combo.get_active_text(),)).fetchone()
+        self.selectedCustomerId = selected[0] if selected else None
+        self.load_list()
+        self.load_descriptions()
+        self.update_time_indicators()
+
+    def load_descriptions(self):
+        self.desc.get_model().clear()
+        for row in self.db_con.execute("SELECT DISTINCT description FROM entries WHERE customerId = ? AND julianday('now') - julianday(date) < 30 ORDER BY description", (self.selectedCustomerId,)):
+            self.desc.append_text(row[0])
+
+    def add_customer(self):
+        if self.selectedCustomerId == None:
+            cur = self.db_con.cursor()
+            cur.execute("INSERT INTO customers(name) values(?)", (self.customer.get_active_text(),))
+            self.selectedCustomerId = cur.lastrowid
+            self.customer.append_text(self.customer.get_active_text())
+
+    def main(self):
+        self.init_db()
+        self.init_display()
+        gtk.main()
+
+    def destroy(self, widget, data=None):
+        self.db_con.close()
+        gtk.main_quit()
+
+
+    def simple_invoice(self, customer_id):
+        self.init_db()
+
+        customer = self.db_con.execute("SELECT id, name, address, rate, currency FROM customers WHERE id = ?", (customer_id,)).fetchone()
+        if not customer:
+            print 'No such customer.'
+            exit()
+
+        sanity = self.db_con.execute("SELECT count(id) FROM entries WHERE customerId = ? AND invoiceNo IS NULL", (customer_id,)).fetchone()
+        if sanity[0] == 0:
+            print 'No unbilled timesheet entries.'
+            exit()
+
+        serial_row = self.db_con.execute("SELECT max(serial) FROM invoices WHERE customerId = ?", (customer_id,)).fetchone()
+        serial = serial_row[0]
+        serial = 0 if serial == None else int(serial)
+        serial += 1
+
+        invoiceNo = "%s-%04d" % (customer_id, serial)
+
+
+        print serial, invoiceNo
+
+        self.db_con.execute("UPDATE entries set invoiceNo = ? WHERE customerId = ? AND invoiceNo IS NULL", (invoiceNo, customer_id))
+
+        hours = self.db_con.execute("select sum(round((substr(finish,1,2)+(substr(finish,4,2)+0.0)/60)-(substr(start,1,2)+(substr(start,4,2)+0.0)/60), 2)) from entries where invoiceNo = ?", (invoiceNo,)).fetchone()
+
+        if customer[4] == "GBP":
+            inv_gst_rate = 0.0
+        else:
+            inv_gst_rate = gst_rate
+
+        self.db_con.execute("INSERT INTO invoices(customerId, serial, date, gstRate, name, address, currency) values(?,?,?,?,?,?,?)", (customer_id, serial, datetime.now().date(), inv_gst_rate, customer[1], customer[2], customer[4]))
+        self.db_con.execute("INSERT INTO invoiceLines(customerId, serial, qty, desc, unit_price) values(?,?,?,?,?)", (customer_id, serial, hours[0], "Hours software development", customer[3]))
+
+        self.db_con.commit()
+
+        self.regenerate_invoice(invoiceNo)
+
+
+    def one_off(self, customer_id, description, amount):
+        self.init_db()
+
+        customer = self.db_con.execute("SELECT id, name, address, rate, currency FROM customers WHERE id = ?", (customer_id,)).fetchone()
+        if not customer:
+            print 'No such customer.'
+            exit(1)
+
+        serial_row = self.db_con.execute("SELECT max(serial) FROM invoices WHERE customerId = ?", (customer_id,)).fetchone()
+        serial = serial_row[0]
+        serial = 0 if serial == None else int(serial)
+        serial += 1
+
+        invoiceNo = "%s-%04d" % (customer_id, serial)
+
+        amount = amount.strip()
+        try:
+          float(amount)
+        except ValueError:
+            print 'Amount must be a number.'
+            exit(1)
+
+        if customer[4] == "GBP":
+            inv_gst_rate = 0.0
+        else:
+            inv_gst_rate = gst_rate
+
+        self.db_con.execute("INSERT INTO invoices(customerId, serial, date, gstRate, name, address, currency) values(?,?,?,?,?,?,?)", (customer_id, serial, datetime.now().date(), inv_gst_rate, customer[1], customer[2], customer[4]))
+        self.db_con.execute("INSERT INTO invoiceLines(customerId, serial, qty, desc, unit_price) values(?,?,?,?,?)", (customer_id, serial, 1, description, amount))
+
+        self.db_con.commit()
+
+        self.regenerate_invoice(invoiceNo)
+
+
+    def regenerate_invoice(self, invoice_no):
+        self. init_db()
+
+        customer_id, serial = invoice_no.split('-')
+
+        invoice_row = self.db_con.execute("SELECT customerId, serial, date, gstRate, name, address, currency FROM invoices WHERE customerId = ? and serial = ?", (customer_id,serial)).fetchone()
+
+        i = invoice.invoice()
+        i.date = invoice_row[2]
+        i.number = invoice_no
+        i.gst_no = '61-213-015'
+        i.address = invoice_row[4] + "\n" + invoice_row[5]
+        i.gst_rate = float(invoice_row[3])
+
+        if invoice_row[6] == "GBP":
+            i.notes = [
+                "Please pay by BACS to account Sort code:30-93-79 Account Number: 13825560",
+                "Please advise remittance by email"
+            ]
+            i.currency_symbol = u'£'
+        else:
+            i.notes = [
+                "Please pay by direct credit to: Kiwibank 38-9000-0038392-05",
+                "Payment Terms: 7 Days"
+            ]
+            i.currency_symbol = '$'
+
+        i.lines = self.db_con.execute("SELECT qty, desc, unit_price FROM invoiceLines WHERE customerId = ? AND serial = ? ORDER BY id", (customer_id,serial)).fetchall()
+
+        print i.lines
+
+        i.render(invoice_no + ".pdf")
+
+
+    def hours(self, customer_id):
+        self.init_db()
+
+        hours = self.db_con.execute("select sum(round((substr(finish,1,2)+(substr(finish,4,2)+0.0)/60)-(substr(start,1,2)+(substr(start,4,2)+0.0)/60), 2)) from entries where invoiceNo is null and customerId=?", (customer_id,)).fetchone()
+        print hours
+
+
+    def customer_summary(self):
+        self.init_db()
+
+        q = """
+          SELECT
+            customers.id,
+            customers.name,
+            customers.rate,
+            sum(round((substr(finish,1,2)+(substr(finish,4,2)+0.0)/60)-(substr(start,1,2)+(substr(start,4,2)+0.0)/60), 2)),
+            round(customers.rate * sum(round((substr(finish,1,2)+(substr(finish,4,2)+0.0)/60)-(substr(start,1,2)+(substr(start,4,2)+0.0)/60), 2)), 2)
+          FROM customers LEFT JOIN entries ON customerId=customers.id
+          WHERE invoiceNo is NULL
+          GROUP BY customers.id
+          ORDER BY customers.id
+        """
+
+        rows = self.db_con.execute(q).fetchall()
+        for row in rows:
+          print "%5i %-30s %6s %8s %10s" % row
+
+
+
+print __name__
+if __name__ == "__main__":
+    base = Base()
+
+    argc = len(sys.argv)
+    if argc == 1:
+        base.main()
+    elif argc == 2 and sys.argv[1] == "-c":
+        base.customer_summary()
+    elif argc == 3 and sys.argv[1] == "-s":
+        base.simple_invoice(sys.argv[2])
+    elif argc == 3 and sys.argv[1] == "-r":
+        base.regenerate_invoice(sys.argv[2])
+    elif argc == 3 and sys.argv[1] == "-h":
+        base.hours(sys.argv[2])
+    elif argc == 5 and sys.argv[1] == "-o":
+        base.one_off(sys.argv[2], sys.argv[3], sys.argv[4])
+
+
+    else:
+        print """usage: timesheets [-c | -s customer_no | -r invoice_no | -h customer_no | -o customer_no description amount]"""
+
