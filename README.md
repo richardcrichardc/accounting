@@ -1,6 +1,6 @@
 # Various Personal Accounting Projects
 
-Here are a couple of personal accounting programs I written have used over the years.
+Here are a couple of personal accounting programs I have written and used over the years.
 
 ## timesheets
 
